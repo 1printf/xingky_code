@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import argparse
 import codecs
+import json
 import os.path
 import platform
 import shutil
@@ -90,7 +91,7 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # Save as Pascal voc xml
         self.default_save_dir = default_save_dir
-        self.label_file_format = settings.get(SETTING_LABEL_FILE_FORMAT, LabelFileFormat.PASCAL_VOC)
+        self.label_file_format = settings.get(SETTING_LABEL_FILE_FORMAT, LabelFileFormat.YOLO)
 
         # For loading all image under a directory
         self.m_img_list = []
@@ -102,6 +103,13 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # Whether we need to save or not.
         self.dirty = False
+
+        # Debounced auto-save: after each annotation change, save shortly after
+        # the last edit so continuous drags don't write the file on every move.
+        self.auto_save_timer = QTimer(self)
+        self.auto_save_timer.setSingleShot(True)
+        self.auto_save_timer.setInterval(400)
+        self.auto_save_timer.timeout.connect(self.auto_save)
 
         self._no_selection_slot = False
         self._beginner = True
@@ -127,8 +135,15 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # Create a widget for using default label
         self.use_default_label_checkbox = QCheckBox(get_str('useDefaultLabel'))
-        self.use_default_label_checkbox.setChecked(False)
+        self.use_default_label_checkbox.setChecked(settings.get(SETTING_USE_DEFAULT_LABEL, True))
         self.default_label_combo_box = DefaultLabelComboBox(self,items=self.label_hist)
+
+        # Restore the previously selected default label (e.g. "phone")
+        saved_default_label = settings.get(SETTING_DEFAULT_LABEL, None)
+        if saved_default_label and saved_default_label in self.label_hist:
+            self.default_label = saved_default_label
+            self.default_label_combo_box.cb.setCurrentIndex(
+                self.label_hist.index(saved_default_label))
 
         use_default_label_qhbox_layout = QHBoxLayout()
         use_default_label_qhbox_layout.addWidget(self.use_default_label_checkbox)
@@ -237,7 +252,10 @@ class MainWindow(QMainWindow, WindowMixin):
                                  'a', 'prev', get_str('prevImgDetail'))
 
         verify = action(get_str('verifyImg'), self.verify_image,
-                        'space', 'verify', get_str('verifyImgDetail'))
+                        None, 'verify', get_str('verifyImgDetail'))
+
+        paste_and_next = action('Paste & Next', self.paste_and_next_image,
+                                'space', 'paste_next', 'Paste previous bounding boxes and jump to next image')
 
         save = action(get_str('save'), self.save_file,
                       'Ctrl+S', 'save', get_str('saveDetail'), enabled=False)
@@ -282,6 +300,10 @@ class MainWindow(QMainWindow, WindowMixin):
         copy = action(get_str('dupBox'), self.copy_selected_shape,
                       'Ctrl+D', 'copy', get_str('dupBoxDetail'),
                       enabled=False)
+        copy_combined = action('Copy Prev + Dup', self.copy_combined,
+                               'Ctrl+Shift+V', 'copy_combined',
+                               'Copy previous bounding boxes & duplicate selected',
+                               enabled=False)
 
         advanced_mode = action(get_str('advancedMode'), self.toggle_advanced_mode,
                                'Ctrl+Shift+A', 'expert', get_str('advancedModeDetail'),
@@ -381,8 +403,9 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # Store actions for further handling.
         self.actions = Struct(save=save, save_format=save_format, saveAs=save_as, open=open, close=close, resetAll=reset_all, deleteImg=delete_image,
-                              lineColor=color1, create=create, delete=delete, edit=edit, copy=copy,
+                              lineColor=color1, create=create, delete=delete, edit=edit, copy=copy, copyCombined=copy_combined,
                               createMode=create_mode, editMode=edit_mode, advancedMode=advanced_mode,
+                              pasteAndNext=paste_and_next,
                               shapeLineColor=shape_line_color, shapeFillColor=shape_fill_color,
                               zoom=zoom, zoomIn=zoom_in, zoomOut=zoom_out, zoomOrg=zoom_org,
                               fitWindow=fit_window, fitWidth=fit_width,
@@ -392,10 +415,10 @@ class MainWindow(QMainWindow, WindowMixin):
                               fileMenuActions=(
                                   open, open_dir, save, save_as, close, reset_all, quit),
                               beginner=(), advanced=(),
-                              editMenu=(edit, copy, delete,
+                              editMenu=(edit, copy, copy_combined, delete,
                                         None, color1, self.draw_squares_option),
-                              beginnerContext=(create, edit, copy, delete),
-                              advancedContext=(create_mode, edit_mode, edit, copy,
+                              beginnerContext=(create, edit, copy, copy_combined, delete),
+                              advancedContext=(create_mode, edit_mode, edit, copy, copy_combined,
                                                delete, shape_line_color, shape_fill_color),
                               onLoadActive=(
                                   close, create, create_mode, edit_mode),
@@ -449,13 +472,14 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.tools = self.toolbar('Tools')
         self.actions.beginner = (
-            open, open_dir, change_save_dir, open_next_image, open_prev_image, verify, save, save_format, None, create, copy, delete, None,
+            open, open_dir, change_save_dir, open_next_image, open_prev_image, verify, paste_and_next, save, save_format, None, create, copy, copy_combined, delete, None,
             zoom_in, zoom, zoom_out, fit_window, fit_width, None,
             light_brighten, light, light_darken, light_org)
 
         self.actions.advanced = (
-            open, open_dir, change_save_dir, open_next_image, open_prev_image, save, save_format, None,
+            open, open_dir, change_save_dir, open_next_image, open_prev_image, paste_and_next, save, save_format, None,
             create_mode, edit_mode, None,
+            copy, copy_combined, None,
             hide_all, show_all)
 
         self.statusBar().showMessage('%s started.' % __appname__)
@@ -535,17 +559,52 @@ class MainWindow(QMainWindow, WindowMixin):
         self.label_coordinates = QLabel('')
         self.statusBar().addPermanentWidget(self.label_coordinates)
 
+        # === Crash Recovery System ===
+        self.recovery_dir = os.path.join(os.path.expanduser("~"), ".labelImg_recovery")
+        self.recovery_file = os.path.join(self.recovery_dir, "recovery.json")
+        self._recovery_dirty = False
+
+        # Auto-save timer: save unsaved work every 30 seconds
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.timeout.connect(self._auto_save_recovery)
+        self._recovery_timer.start(30000)  # 30 seconds
+
+        # Watchdog timer: detect UI freeze (fires every 2 seconds)
+        self._watchdog_counter = 0
+        self._watchdog_timer = QTimer(self)
+        self._watchdog_timer.timeout.connect(self._watchdog_tick)
+        self._watchdog_timer.start(2000)  # 2 seconds
+
+        # Check for unsaved recovery data from a previous crash
+        QTimer.singleShot(500, self._check_recovery)
+
         # Open Dir if default file
         if self.file_path and os.path.isdir(self.file_path):
             self.open_dir_dialog(dir_path=self.file_path, silent=True)
+
+    def keyPressEvent(self, event):
+        """Track Ctrl key state for square-drawing mode.
+
+        Uses a timer-based approach: on Ctrl press, enable square mode.
+        On any non-modifier key press while Ctrl is held (i.e. a shortcut),
+        temporarily disable square mode so shortcuts work normally.
+        """
+        if event.key() == Qt.Key_Control:
+            self.canvas.set_drawing_shape_to_square(True)
+        elif event.modifiers() & Qt.ControlModifier:
+            # A non-Ctrl key was pressed while Ctrl is held (a shortcut like Ctrl+D).
+            # Temporarily disable square mode so shortcuts work without side effects.
+            self.canvas.set_drawing_shape_to_square(False)
+            # Re-enable after a short delay if Ctrl is still held
+            QTimer.singleShot(100, self._restore_square_mode)
 
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key_Control:
             self.canvas.set_drawing_shape_to_square(False)
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Control:
-            # Draw rectangle if Ctrl is pressed
+    def _restore_square_mode(self):
+        """Re-enable square drawing if Ctrl is still being held."""
+        if QApplication.keyboardModifiers() & Qt.ControlModifier:
             self.canvas.set_drawing_shape_to_square(True)
 
     # Support Functions #
@@ -617,8 +676,13 @@ class MainWindow(QMainWindow, WindowMixin):
         add_actions(self.tools, self.actions.advanced)
 
     def set_dirty(self):
+        """Mark current work as dirty (unsaved) and flag for recovery."""
         self.dirty = True
+        self._recovery_dirty = True
         self.actions.save.setEnabled(True)
+        # Auto-save mode: schedule a debounced save once the edit settles.
+        if self.auto_saving.isChecked() and self.file_path is not None:
+            self.auto_save_timer.start()
 
     def set_clean(self):
         self.dirty = False
@@ -730,6 +794,17 @@ class MainWindow(QMainWindow, WindowMixin):
         self.toggle_draw_mode(True)
         self.label_selection_changed()
 
+    def enter_create_mode(self):
+        """Enter draw (crosshair) mode — equivalent to pressing 'w'.
+
+        Auto-activated after switching images so the annotator can immediately
+        start drawing on the new image without pressing 'w' each time.
+        """
+        if self.beginner():
+            self.create_shape()
+        else:
+            self.set_create_mode()
+
     def update_file_menu(self):
         curr_file_path = self.file_path
 
@@ -808,6 +883,7 @@ class MainWindow(QMainWindow, WindowMixin):
                 self.label_list.clearSelection()
         self.actions.delete.setEnabled(selected)
         self.actions.copy.setEnabled(selected)
+        self.actions.copyCombined.setEnabled(selected)
         self.actions.edit.setEnabled(selected)
         self.actions.shapeLineColor.setEnabled(selected)
         self.actions.shapeFillColor.setEnabled(selected)
@@ -883,12 +959,20 @@ class MainWindow(QMainWindow, WindowMixin):
             self.label_file.verified = self.canvas.verified
 
         def format_shape(s):
-            return dict(label=s.label,
-                        line_color=s.line_color.getRgb(),
-                        fill_color=s.fill_color.getRgb(),
-                        points=[(p.x(), p.y()) for p in s.points],
-                        # add chris
-                        difficult=s.difficult)
+            try:
+                return dict(label=s.label,
+                            line_color=s.line_color.getRgb(),
+                            fill_color=s.fill_color.getRgb(),
+                            points=[(p.x(), p.y()) for p in s.points],
+                            # add chris
+                            difficult=s.difficult)
+            except Exception as e:
+                print('Warning: Error formatting shape: %s' % e)
+                return dict(label='unknown',
+                            line_color=(0, 0, 0, 255),
+                            fill_color=(0, 0, 0, 255),
+                            points=[(0, 0), (0, 0), (0, 0), (0, 0)],
+                            difficult=False)
 
         shapes = [format_shape(shape) for shape in self.canvas.shapes]
         # Can add different annotation formats here
@@ -903,6 +987,24 @@ class MainWindow(QMainWindow, WindowMixin):
                     annotation_file_path += TXT_EXT
                 self.label_file.save_yolo_format(annotation_file_path, shapes, self.file_path, self.image_data, self.label_hist,
                                                  self.line_color.getRgb(), self.fill_color.getRgb())
+                # Also save image as JPG alongside the YOLO txt file
+                try:
+                    jpg_path = os.path.splitext(annotation_file_path)[0] + '.jpg'
+                    # Don't overwrite the original image if save dir == image dir
+                    if os.path.abspath(jpg_path) != os.path.abspath(self.file_path):
+                        image = QImage(self.file_path)
+                        if not image.isNull():
+                            # Write to temp file first, then rename for safety
+                            tmp_path = jpg_path + '.tmp'
+                            if image.save(tmp_path, 'JPG', 95):
+                                os.replace(tmp_path, jpg_path)
+                                print('Image:{0} -> JPG:{1}'.format(self.file_path, jpg_path))
+                            else:
+                                print('Warning: Failed to save JPG image copy to %s' % jpg_path)
+                    else:
+                        print('Skipping JPG copy: source and destination are the same file')
+                except Exception as e:
+                    print('Warning: Failed to save JPG image copy: %s' % e)
             elif self.label_file_format == LabelFileFormat.CREATE_ML:
                 if annotation_file_path[-5:].lower() != ".json":
                     annotation_file_path += JSON_EXT
@@ -916,11 +1018,29 @@ class MainWindow(QMainWindow, WindowMixin):
         except LabelFileError as e:
             self.error_message(u'Error saving label data', u'<b>%s</b>' % e)
             return False
+        except Exception as e:
+            self.error_message(u'Error saving file', u'<b>Unexpected error: %s</b>' % e)
+            import traceback
+            traceback.print_exc()
+            return False
 
     def copy_selected_shape(self):
         self.add_label(self.canvas.copy_selected_shape())
         # fix copy and delete
         self.shape_selection_changed(True)
+
+    def copy_combined(self):
+        """Combined action: copy previous bounding boxes AND duplicate selected shape.
+
+        Bound to Ctrl+Shift+V. Does both:
+        1. Copies all bounding boxes from the previous image (like Ctrl+V)
+        2. If a shape is selected, duplicates it (like Ctrl+D)
+        """
+        # Step 1: Copy previous bounding boxes
+        self.copy_previous_bounding_boxes()
+        # Step 2: If there's a selected shape, duplicate it too
+        if self.canvas.selected_shape is not None:
+            self.copy_selected_shape()
 
     def combo_selection_changed(self, index):
         text = self.combo_box.cb.itemText(index)
@@ -1092,84 +1212,96 @@ class MainWindow(QMainWindow, WindowMixin):
 
     def load_file(self, file_path=None):
         """Load the specified file, or the last opened file if None."""
-        self.reset_state()
-        self.canvas.setEnabled(False)
-        if file_path is None:
-            file_path = self.settings.get(SETTING_FILENAME)
-        # Make sure that filePath is a regular python string, rather than QString
-        file_path = ustr(file_path)
+        try:
+            self.reset_state()
+            self.canvas.setEnabled(False)
+            if file_path is None:
+                file_path = self.settings.get(SETTING_FILENAME)
+            # Make sure that filePath is a regular python string, rather than QString
+            file_path = ustr(file_path)
 
-        # Fix bug: An  index error after select a directory when open a new file.
-        unicode_file_path = ustr(file_path)
-        unicode_file_path = os.path.abspath(unicode_file_path)
-        # Tzutalin 20160906 : Add file list and dock to move faster
-        # Highlight the file item
-        if unicode_file_path and self.file_list_widget.count() > 0:
-            if unicode_file_path in self.m_img_list:
-                index = self.m_img_list.index(unicode_file_path)
-                file_widget_item = self.file_list_widget.item(index)
-                file_widget_item.setSelected(True)
-            else:
-                self.file_list_widget.clear()
-                self.m_img_list.clear()
+            # Fix bug: An  index error after select a directory when open a new file.
+            unicode_file_path = ustr(file_path)
+            unicode_file_path = os.path.abspath(unicode_file_path)
+            # Tzutalin 20160906 : Add file list and dock to move faster
+            # Highlight the file item
+            if unicode_file_path and self.file_list_widget.count() > 0:
+                if unicode_file_path in self.m_img_list:
+                    index = self.m_img_list.index(unicode_file_path)
+                    file_widget_item = self.file_list_widget.item(index)
+                    file_widget_item.setSelected(True)
+                else:
+                    self.file_list_widget.clear()
+                    self.m_img_list.clear()
 
-        if unicode_file_path and os.path.exists(unicode_file_path):
-            if LabelFile.is_label_file(unicode_file_path):
-                try:
-                    self.label_file = LabelFile(unicode_file_path)
-                except LabelFileError as e:
+            if unicode_file_path and os.path.exists(unicode_file_path):
+                if LabelFile.is_label_file(unicode_file_path):
+                    try:
+                        self.label_file = LabelFile(unicode_file_path)
+                    except LabelFileError as e:
+                        self.error_message(u'Error opening file',
+                                           (u"<p><b>%s</b></p>"
+                                            u"<p>Make sure <i>%s</i> is a valid label file.")
+                                           % (e, unicode_file_path))
+                        self.status("Error reading %s" % unicode_file_path)
+
+                        return False
+                    self.image_data = self.label_file.image_data
+                    self.line_color = QColor(*self.label_file.lineColor)
+                    self.fill_color = QColor(*self.label_file.fillColor)
+                    self.canvas.verified = self.label_file.verified
+                else:
+                    # Load image:
+                    # read data first and store for saving into label file.
+                    self.image_data = read(unicode_file_path, None)
+                    self.label_file = None
+                    self.canvas.verified = False
+
+                if isinstance(self.image_data, QImage):
+                    image = self.image_data
+                else:
+                    image = QImage.fromData(self.image_data)
+                if image.isNull():
                     self.error_message(u'Error opening file',
-                                       (u"<p><b>%s</b></p>"
-                                        u"<p>Make sure <i>%s</i> is a valid label file.")
-                                       % (e, unicode_file_path))
+                                       u"<p>Make sure <i>%s</i> is a valid image file." % unicode_file_path)
                     self.status("Error reading %s" % unicode_file_path)
-                    
                     return False
-                self.image_data = self.label_file.image_data
-                self.line_color = QColor(*self.label_file.lineColor)
-                self.fill_color = QColor(*self.label_file.fillColor)
-                self.canvas.verified = self.label_file.verified
-            else:
-                # Load image:
-                # read data first and store for saving into label file.
-                self.image_data = read(unicode_file_path, None)
-                self.label_file = None
-                self.canvas.verified = False
+                # Safety: warn on extremely large images that may cause freeze/OOM
+                MAX_DIM = 10000
+                if image.width() > MAX_DIM or image.height() > MAX_DIM:
+                    print('Warning: Image is very large (%dx%d), may be slow. Consider resizing.'
+                          % (image.width(), image.height()))
+                self.status("Loaded %s" % os.path.basename(unicode_file_path))
+                self.image = image
+                self.file_path = unicode_file_path
+                self.canvas.load_pixmap(QPixmap.fromImage(image))
+                if self.label_file:
+                    self.load_labels(self.label_file.shapes)
+                self.set_clean()
+                self.canvas.setEnabled(True)
+                self.adjust_scale(initial=True)
+                self.paint_canvas()
+                self.add_recent_file(self.file_path)
+                self.toggle_actions(True)
+                self.show_bounding_box_from_annotation_file(self.file_path)
 
-            if isinstance(self.image_data, QImage):
-                image = self.image_data
-            else:
-                image = QImage.fromData(self.image_data)
-            if image.isNull():
-                self.error_message(u'Error opening file',
-                                   u"<p>Make sure <i>%s</i> is a valid image file." % unicode_file_path)
-                self.status("Error reading %s" % unicode_file_path)
-                return False
-            self.status("Loaded %s" % os.path.basename(unicode_file_path))
-            self.image = image
-            self.file_path = unicode_file_path
-            self.canvas.load_pixmap(QPixmap.fromImage(image))
-            if self.label_file:
-                self.load_labels(self.label_file.shapes)
-            self.set_clean()
-            self.canvas.setEnabled(True)
-            self.adjust_scale(initial=True)
-            self.paint_canvas()
-            self.add_recent_file(self.file_path)
-            self.toggle_actions(True)
-            self.show_bounding_box_from_annotation_file(self.file_path)
+                counter = self.counter_str()
+                self.setWindowTitle(__appname__ + ' ' + file_path + ' ' + counter)
 
-            counter = self.counter_str()
-            self.setWindowTitle(__appname__ + ' ' + file_path + ' ' + counter)
+                # Default : select last item if there is at least one item
+                if self.label_list.count():
+                    self.label_list.setCurrentItem(self.label_list.item(self.label_list.count() - 1))
+                    self.label_list.item(self.label_list.count() - 1).setSelected(True)
 
-            # Default : select last item if there is at least one item
-            if self.label_list.count():
-                self.label_list.setCurrentItem(self.label_list.item(self.label_list.count() - 1))
-                self.label_list.item(self.label_list.count() - 1).setSelected(True)
-
-            self.canvas.setFocus(True)
-            return True
-        return False
+                self.canvas.setFocus(True)
+                return True
+            return False
+        except Exception as e:
+            self.error_message(u'Error loading file',
+                               u'<p>Unexpected error while loading <i>%s</i>:</p><p><b>%s</b></p>' % (file_path, e))
+            import traceback
+            traceback.print_exc()
+            return False
 
     def counter_str(self):
         """
@@ -1214,12 +1346,26 @@ class MainWindow(QMainWindow, WindowMixin):
         super(MainWindow, self).resizeEvent(event)
 
     def paint_canvas(self):
-        assert not self.image.isNull(), "cannot paint null image"
-        self.canvas.scale = 0.01 * self.zoom_widget.value()
-        self.canvas.overlay_color = self.light_widget.color()
-        self.canvas.label_font_size = int(0.02 * max(self.image.width(), self.image.height()))
-        self.canvas.adjustSize()
-        self.canvas.update()
+        try:
+            # Reset watchdog counter — UI is responsive
+            self._watchdog_counter = 0
+
+            if self.image.isNull():
+                print('Warning: cannot paint null image')
+                return
+            self.canvas.scale = 0.01 * self.zoom_widget.value()
+            self.canvas.overlay_color = self.light_widget.color()
+            # Protect against zero-size images
+            img_max_dim = max(self.image.width(), self.image.height())
+            if img_max_dim <= 0:
+                img_max_dim = 1
+            self.canvas.label_font_size = int(0.02 * img_max_dim)
+            self.canvas.adjustSize()
+            self.canvas.update()
+        except Exception as e:
+            print('Error in paint_canvas: %s' % e)
+            import traceback
+            traceback.print_exc()
 
     def adjust_scale(self, initial=False):
         value = self.scalers[self.FIT_WINDOW if initial else self.zoom_mode]()
@@ -1230,21 +1376,30 @@ class MainWindow(QMainWindow, WindowMixin):
         e = 2.0  # So that no scrollbars are generated.
         w1 = self.centralWidget().width() - e
         h1 = self.centralWidget().height() - e
+        if w1 <= 0 or h1 <= 0:
+            return 1.0
         a1 = w1 / h1
         # Calculate a new scale value based on the pixmap's aspect ratio.
         w2 = self.canvas.pixmap.width() - 0.0
         h2 = self.canvas.pixmap.height() - 0.0
+        if w2 <= 0 or h2 <= 0:
+            return 1.0
         a2 = w2 / h2
         return w1 / w2 if a2 >= a1 else h1 / h2
 
     def scale_fit_width(self):
         # The epsilon does not seem to work too well here.
         w = self.centralWidget().width() - 2.0
+        if w <= 0 or self.canvas.pixmap.width() <= 0:
+            return 1.0
         return w / self.canvas.pixmap.width()
 
     def closeEvent(self, event):
         if not self.may_continue():
             event.ignore()
+            return
+        # Clean up recovery file on clean exit
+        self._cleanup_recovery()
         settings = self.settings
         # If it loads images from dir, don't load it at the beginning
         if self.dir_name is None:
@@ -1274,6 +1429,8 @@ class MainWindow(QMainWindow, WindowMixin):
         settings[SETTING_PAINT_LABEL] = self.display_label_option.isChecked()
         settings[SETTING_DRAW_SQUARE] = self.draw_squares_option.isChecked()
         settings[SETTING_LABEL_FILE_FORMAT] = self.label_file_format
+        settings[SETTING_USE_DEFAULT_LABEL] = self.use_default_label_checkbox.isChecked()
+        settings[SETTING_DEFAULT_LABEL] = self.default_label
         settings.save()
 
     def load_recent(self, filename):
@@ -1281,17 +1438,28 @@ class MainWindow(QMainWindow, WindowMixin):
             self.load_file(filename)
 
     def scan_all_images(self, folder_path):
-        extensions = ['.%s' % fmt.data().decode("ascii").lower() for fmt in QImageReader.supportedImageFormats()]
-        images = []
+        MAX_IMAGES = 99999  # Safety limit to prevent OOM
+        try:
+            extensions = ['.%s' % fmt.data().decode("ascii").lower() for fmt in QImageReader.supportedImageFormats()]
+            images = []
 
-        for root, dirs, files in os.walk(folder_path):
-            for file in files:
-                if file.lower().endswith(tuple(extensions)):
-                    relative_path = os.path.join(root, file)
-                    path = ustr(os.path.abspath(relative_path))
-                    images.append(path)
-        natural_sort(images, key=lambda x: x.lower())
-        return images
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    if file.lower().endswith(tuple(extensions)):
+                        relative_path = os.path.join(root, file)
+                        path = ustr(os.path.abspath(relative_path))
+                        images.append(path)
+                        if len(images) >= MAX_IMAGES:
+                            print('Warning: Reached maximum image limit (%d), stopping scan.' % MAX_IMAGES)
+                            natural_sort(images, key=lambda x: x.lower())
+                            return images
+            natural_sort(images, key=lambda x: x.lower())
+            return images
+        except Exception as e:
+            print('Error scanning images in %s: %s' % (folder_path, e))
+            import traceback
+            traceback.print_exc()
+            return []
 
     def change_save_dir_dialog(self, _value=False):
         if self.default_save_dir is not None:
@@ -1329,16 +1497,24 @@ class MainWindow(QMainWindow, WindowMixin):
                     filename = filename[0]
             self.load_pascal_xml_by_filename(filename)
 
+        elif self.label_file_format == LabelFileFormat.YOLO:
+            filters = "Open Annotation TXT file (%s)" % ' '.join(['*.txt'])
+            filename = ustr(QFileDialog.getOpenFileName(self, '%s - Choose a txt file' % __appname__, path, filters))
+            if filename:
+                if isinstance(filename, (tuple, list)):
+                    filename = filename[0]
+                self.load_yolo_txt_by_filename(filename)
+
         elif self.label_file_format == LabelFileFormat.CREATE_ML:
-            
+
             filters = "Open Annotation JSON file (%s)" % ' '.join(['*.json'])
             filename = ustr(QFileDialog.getOpenFileName(self, '%s - Choose a json file' % __appname__, path, filters))
             if filename:
                 if isinstance(filename, (tuple, list)):
                     filename = filename[0]
 
-            self.load_create_ml_json_by_filename(filename, self.file_path)         
-        
+            self.load_create_ml_json_by_filename(filename, self.file_path)
+
 
     def open_dir_dialog(self, _value=False, dir_path=None, silent=False):
         if not self.may_continue():
@@ -1362,19 +1538,29 @@ class MainWindow(QMainWindow, WindowMixin):
             self.show_bounding_box_from_annotation_file(file_path=self.file_path)
 
     def import_dir_images(self, dir_path):
-        if not self.may_continue() or not dir_path:
-            return
+        try:
+            if not self.may_continue() or not dir_path:
+                return
 
-        self.last_open_dir = dir_path
-        self.dir_name = dir_path
-        self.file_path = None
-        self.file_list_widget.clear()
-        self.m_img_list = self.scan_all_images(dir_path)
-        self.img_count = len(self.m_img_list)
-        self.open_next_image()
-        for imgPath in self.m_img_list:
-            item = QListWidgetItem(imgPath)
-            self.file_list_widget.addItem(item)
+            self.last_open_dir = dir_path
+            self.dir_name = dir_path
+            self.file_path = None
+            self.file_list_widget.clear()
+            self.m_img_list = self.scan_all_images(dir_path)
+            self.img_count = len(self.m_img_list)
+            self.open_next_image()
+            # Batch add items to avoid UI freeze with large lists
+            self.file_list_widget.setUpdatesEnabled(False)
+            for imgPath in self.m_img_list:
+                item = QListWidgetItem(imgPath)
+                self.file_list_widget.addItem(item)
+            self.file_list_widget.setUpdatesEnabled(True)
+        except Exception as e:
+            print('Error importing directory images from %s: %s' % (dir_path, e))
+            import traceback
+            traceback.print_exc()
+            self.error_message(u'Error opening directory',
+                               u'<p>Failed to import images from <i>%s</i>:</p><p><b>%s</b></p>' % (dir_path, e))
 
     def verify_image(self, _value=False):
         # Proceeding next image without dialog if having any label
@@ -1395,14 +1581,10 @@ class MainWindow(QMainWindow, WindowMixin):
             self.save_file()
 
     def open_prev_image(self, _value=False):
-        # Proceeding prev image without dialog if having any label
-        if self.auto_saving.isChecked():
-            if self.default_save_dir is not None:
-                if self.dirty is True:
-                    self.save_file()
-            else:
-                self.change_save_dir_dialog()
-                return
+        # Auto-save the current annotations before switching images
+        # (saves without the unsaved-changes confirmation dialog).
+        if self.dirty:
+            self.save_file()
 
         if not self.may_continue():
             return
@@ -1417,17 +1599,14 @@ class MainWindow(QMainWindow, WindowMixin):
             self.cur_img_idx -= 1
             filename = self.m_img_list[self.cur_img_idx]
             if filename:
-                self.load_file(filename)
+                if self.load_file(filename):
+                    self.enter_create_mode()
 
     def open_next_image(self, _value=False):
-        # Proceeding next image without dialog if having any label
-        if self.auto_saving.isChecked():
-            if self.default_save_dir is not None:
-                if self.dirty is True:
-                    self.save_file()
-            else:
-                self.change_save_dir_dialog()
-                return
+        # Auto-save the current annotations before switching images
+        # (saves without the unsaved-changes confirmation dialog).
+        if self.dirty:
+            self.save_file()
 
         if not self.may_continue():
             return
@@ -1448,7 +1627,8 @@ class MainWindow(QMainWindow, WindowMixin):
                 filename = self.m_img_list[self.cur_img_idx]
 
         if filename:
-            self.load_file(filename)
+            if self.load_file(filename):
+                self.enter_create_mode()
 
     def open_file(self, _value=False):
         if not self.may_continue():
@@ -1463,6 +1643,36 @@ class MainWindow(QMainWindow, WindowMixin):
             self.cur_img_idx = 0
             self.img_count = 1
             self.load_file(filename)
+
+    def auto_save(self):
+        """Save the current annotations without user interaction.
+
+        Triggered by the debounced timer from set_dirty() whenever Auto Save
+        Mode is enabled. Never opens a dialog: if no save location is known,
+        skip and warn instead of interrupting the labeling flow.
+        """
+        if not self.auto_saving.isChecked():
+            return
+        if self.file_path is None or not self.dirty:
+            return
+
+        image_file_name = os.path.basename(self.file_path)
+        saved_file_name = os.path.splitext(image_file_name)[0]
+
+        if self.default_save_dir is not None and len(ustr(self.default_save_dir)):
+            saved_path = os.path.join(ustr(self.default_save_dir), saved_file_name)
+        elif self.label_file is not None:
+            # No save dir chosen, but an annotation file already exists next to
+            # the image, so save back to it.
+            saved_path = os.path.join(os.path.dirname(self.file_path), saved_file_name)
+        else:
+            # No save dir and no existing annotation: can't pick a location
+            # without a dialog. Skip silently-ish instead of blocking.
+            print('Warning: Auto-save skipped for %s. Set a save dir (Ctrl+R) or save manually (Ctrl+S).' % self.file_path)
+            self.status(u'Auto-save skipped: no save directory set. Press Ctrl+R to choose one.', 5000)
+            return
+
+        self._save_file(saved_path)
 
     def save_file(self, _value=False):
         if self.default_save_dir is not None and len(ustr(self.default_save_dir)):
@@ -1662,12 +1872,208 @@ class MainWindow(QMainWindow, WindowMixin):
             self.show_bounding_box_from_annotation_file(prev_file_path)
             self.save_file()
 
+    def paste_and_next_image(self, _value=False):
+        """Paste bounding boxes from the previous image, then jump to the next image.
+
+        First copies annotations from the previous image (if available), then
+        advances to the next image. Accessible via the toolbar button and the
+        space bar.
+        """
+        # Step 1: Paste — copy bounding boxes from previous image
+        try:
+            self.copy_previous_bounding_boxes()
+        except (ValueError, IndexError):
+            pass  # No previous image or file not in image list
+        # Step 2: Jump to next image
+        self.open_next_image()
+
     def toggle_paint_labels_option(self):
         for shape in self.canvas.shapes:
             shape.paint_label = self.display_label_option.isChecked()
 
     def toggle_draw_square(self):
         self.canvas.set_drawing_shape_to_square(self.draw_squares_option.isChecked())
+
+    # === Crash Recovery Methods ===
+
+    def _auto_save_recovery(self):
+        """Periodically save unsaved work to recovery file (every 30s)."""
+        try:
+            if not self._recovery_dirty:
+                return  # No new changes since last recovery save
+            if not self.file_path:
+                return  # No file loaded
+            self._save_recovery_data()
+        except Exception as e:
+            print('Recovery auto-save failed: %s' % e)
+
+    def _save_recovery_data(self):
+        """Save current work to the recovery file."""
+        try:
+            shapes = []
+            for shape in self.canvas.shapes:
+                try:
+                    shapes.append({
+                        'label': shape.label,
+                        'points': [(p.x(), p.y()) for p in shape.points],
+                        'line_color': list(shape.line_color.getRgb()),
+                        'fill_color': list(shape.fill_color.getRgb()),
+                        'difficult': getattr(shape, 'difficult', False),
+                    })
+                except Exception:
+                    continue
+
+            data = {
+                'file_path': self.file_path,
+                'shapes': shapes,
+                'label_hist': self.label_hist[-50:],  # Keep last 50 labels
+                'label_file_format': self.label_file_format.value if hasattr(self.label_file_format, 'value') else str(self.label_file_format),
+                'line_color': list(self.line_color.getRgb()) if self.line_color else None,
+                'fill_color': list(self.fill_color.getRgb()) if self.fill_color else None,
+                'default_save_dir': self.default_save_dir,
+                'timestamp': __import__('time').time(),
+                'verified': self.canvas.verified,
+            }
+
+            # Ensure recovery directory exists
+            if not os.path.exists(self.recovery_dir):
+                os.makedirs(self.recovery_dir)
+
+            # Atomic write: temp file then rename
+            tmp_path = self.recovery_file + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.recovery_file)
+            self._recovery_dirty = False
+        except Exception as e:
+            print('Error saving recovery data: %s' % e)
+            # Clean up temp file
+            tmp_path = self.recovery_file + '.tmp'
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    def _check_recovery(self):
+        """Check for unsaved recovery data from a previous crash."""
+        try:
+            if not os.path.exists(self.recovery_file):
+                return
+
+            # Check if recovery file is stale (> 7 days)
+            try:
+                with open(self.recovery_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                age = __import__('time').time() - data.get('timestamp', 0)
+                if age > 7 * 24 * 3600:  # 7 days
+                    os.remove(self.recovery_file)
+                    print('Removed stale recovery file (%.1f days old)' % (age / 86400))
+                    return
+            except (json.JSONDecodeError, ValueError, KeyError):
+                os.remove(self.recovery_file)
+                print('Removed corrupted recovery file')
+                return
+
+            # Ask user if they want to restore
+            file_path = data.get('file_path', 'unknown')
+            shapes_count = len(data.get('shapes', []))
+            if shapes_count == 0:
+                os.remove(self.recovery_file)
+                return
+
+            reply = QMessageBox.question(
+                self, u'恢复未保存的工作 / Recover Unsaved Work',
+                u'<p><b>检测到上次崩溃前未保存的工作:</b></p>'
+                u'<p>文件: %s</p>'
+                u'<p>标注数量: %d</p>'
+                u'<p>是否恢复?</p>'
+                u'<p><i>Found unsaved work from a previous session. Recover it?</i></p>'
+                % (file_path, shapes_count),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+
+            if reply == QMessageBox.Yes:
+                self._restore_from_recovery(data)
+            else:
+                os.remove(self.recovery_file)
+                print('User declined recovery, removed recovery file.')
+        except Exception as e:
+            print('Error checking recovery: %s' % e)
+            import traceback
+            traceback.print_exc()
+
+    def _restore_from_recovery(self, data):
+        """Restore shapes and settings from recovery data."""
+        try:
+            shapes = data.get('shapes', [])
+            label_hist = data.get('label_hist', [])
+            file_path = data.get('file_path')
+
+            if file_path and os.path.exists(file_path):
+                self.load_file(file_path)
+
+            # Restore label history
+            for label in label_hist:
+                if label not in self.label_hist:
+                    self.label_hist.append(label)
+
+            # Restore shapes
+            restored_shapes = []
+            for s in shapes:
+                try:
+                    shape = Shape(label=s['label'])
+                    for x, y in s['points']:
+                        shape.add_point(QPointF(x, y))
+                    shape.close()
+                    if s.get('line_color'):
+                        shape.line_color = QColor(*s['line_color'])
+                    if s.get('fill_color'):
+                        shape.fill_color = QColor(*s['fill_color'])
+                    if 'difficult' in s:
+                        shape.difficult = s['difficult']
+                    restored_shapes.append(shape)
+                    self.add_label(shape)
+                except Exception as e:
+                    print('Warning: Failed to restore shape: %s' % e)
+                    continue
+
+            if restored_shapes:
+                self.canvas.load_shapes(restored_shapes)
+                self.set_dirty()
+                self.update_combo_box()
+
+            # Clean up recovery file after successful restore
+            if os.path.exists(self.recovery_file):
+                os.remove(self.recovery_file)
+            print('Recovery: Restored %d shapes from %s' % (len(restored_shapes), file_path))
+        except Exception as e:
+            print('Error restoring from recovery: %s' % e)
+            import traceback
+            traceback.print_exc()
+
+    def _watchdog_tick(self):
+        """Watchdog: detect and log potential UI freezes."""
+        self._watchdog_counter += 1
+        # If counter exceeds 15 (30 seconds without reset), log warning
+        # The counter is reset in paint_canvas and other frequent callbacks
+        if self._watchdog_counter > 15:
+            print('WARNING: Possible UI freeze detected (no paint for %d seconds)'
+                  % (self._watchdog_counter * 2))
+
+    def _cleanup_recovery(self):
+        """Remove recovery file on clean exit."""
+        try:
+            self._recovery_timer.stop()
+            self._watchdog_timer.stop()
+            if os.path.exists(self.recovery_file):
+                os.remove(self.recovery_file)
+                print('Clean exit: removed recovery file.')
+            # Also clean up any stale tmp files
+            tmp_path = self.recovery_file + '.tmp'
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception as e:
+            print('Error cleaning up recovery: %s' % e)
 
 def inverted(color):
     return QColor(*[255 - v for v in color.getRgb()])
@@ -1713,10 +2119,39 @@ def get_main_app(argv=None):
     return app, win
 
 
+def global_exception_hook(exc_type, exc_value, exc_traceback):
+    """Global exception hook to catch unhandled exceptions and show error dialogs."""
+    import traceback
+    error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    print('Unhandled exception:\n%s' % error_msg)
+    try:
+        from PyQt5.QtWidgets import QMessageBox
+        QMessageBox.critical(None, u'程序崩溃 / Program Crash',
+                             u'<p><b>程序遇到未处理的错误:</b></p>'
+                             u'<pre>%s</pre>'
+                             u'<p>请截图此错误信息并报告问题。</p>'
+                             u'<p>Please screenshot this error and report the issue.</p>'
+                             % exc_value)
+    except:
+        pass
+    # Call the original exception hook as well
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+
 def main():
     """construct main app and run it"""
-    app, _win = get_main_app(sys.argv)
-    return app.exec_()
+    # Install global exception hook for crash protection
+    sys.excepthook = global_exception_hook
+
+    try:
+        app, _win = get_main_app(sys.argv)
+        return app.exec_()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        QMessageBox.critical(None, u'程序启动失败 / Program Start Failed',
+                             u'<p><b>程序启动失败:</b></p><pre>%s</pre>' % e)
+        return 1
 
 if __name__ == '__main__':
     sys.exit(main())

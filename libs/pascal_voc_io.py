@@ -110,18 +110,24 @@ class PascalVocWriter:
             y_max.text = str(each_object['ymax'])
 
     def save(self, target_file=None):
-        root = self.gen_xml()
-        self.append_objects(root)
-        out_file = None
-        if target_file is None:
-            out_file = codecs.open(
-                self.filename + XML_EXT, 'w', encoding=ENCODE_METHOD)
-        else:
-            out_file = codecs.open(target_file, 'w', encoding=ENCODE_METHOD)
+        try:
+            root = self.gen_xml()
+            self.append_objects(root)
+            out_file = None
+            if target_file is None:
+                out_file = codecs.open(
+                    self.filename + XML_EXT, 'w', encoding=ENCODE_METHOD)
+            else:
+                out_file = codecs.open(target_file, 'w', encoding=ENCODE_METHOD)
 
-        prettify_result = self.prettify(root)
-        out_file.write(prettify_result.decode('utf8'))
-        out_file.close()
+            prettify_result = self.prettify(root)
+            out_file.write(prettify_result.decode('utf8'))
+            out_file.close()
+        except Exception as e:
+            print('Error saving Pascal VOC format: %s' % e)
+            import traceback
+            traceback.print_exc()
+            raise
 
 
 class PascalVocReader:
@@ -134,8 +140,10 @@ class PascalVocReader:
         self.verified = False
         try:
             self.parse_xml()
-        except:
-            pass
+        except Exception as e:
+            print('Error: Failed to parse Pascal VOC XML from %s: %s' % (file_path, e))
+            import traceback
+            traceback.print_exc()
 
     def get_shapes(self):
         return self.shapes
@@ -149,23 +157,28 @@ class PascalVocReader:
         self.shapes.append((label, points, None, None, difficult))
 
     def parse_xml(self):
-        assert self.file_path.endswith(XML_EXT), "Unsupported file format"
-        parser = etree.XMLParser(encoding=ENCODE_METHOD)
-        xml_tree = ElementTree.parse(self.file_path, parser=parser).getroot()
-        filename = xml_tree.find('filename').text
         try:
-            verified = xml_tree.attrib['verified']
-            if verified == 'yes':
-                self.verified = True
-        except KeyError:
-            self.verified = False
+            assert self.file_path.endswith(XML_EXT), "Unsupported file format"
+            parser = etree.XMLParser(encoding=ENCODE_METHOD)
+            xml_tree = ElementTree.parse(self.file_path, parser=parser).getroot()
+            filename = xml_tree.find('filename').text
+            try:
+                verified = xml_tree.attrib['verified']
+                if verified == 'yes':
+                    self.verified = True
+            except KeyError:
+                self.verified = False
 
-        for object_iter in xml_tree.findall('object'):
-            bnd_box = object_iter.find("bndbox")
-            label = object_iter.find('name').text
-            # Add chris
-            difficult = False
-            if object_iter.find('difficult') is not None:
-                difficult = bool(int(object_iter.find('difficult').text))
-            self.add_shape(label, bnd_box, difficult)
-        return True
+            for object_iter in xml_tree.findall('object'):
+                bnd_box = object_iter.find("bndbox")
+                label = object_iter.find('name').text
+                # Add chris
+                difficult = False
+                if object_iter.find('difficult') is not None:
+                    difficult = bool(int(object_iter.find('difficult').text))
+                self.add_shape(label, bnd_box, difficult)
+            return True
+        except Exception as e:
+            print('Error parsing Pascal VOC XML from %s: %s' % (self.file_path, e))
+            import traceback
+            traceback.print_exc()

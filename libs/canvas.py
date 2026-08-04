@@ -1,3 +1,4 @@
+import traceback
 
 try:
     from PyQt5.QtGui import *
@@ -110,6 +111,14 @@ class Canvas(QWidget):
 
     def mouseMoveEvent(self, ev):
         """Update line with last point and current coordinates."""
+        try:
+            self._mouseMoveEvent(ev)
+        except Exception as e:
+            print('Error in Canvas.mouseMoveEvent: %s' % e)
+            import traceback
+            traceback.print_exc()
+
+    def _mouseMoveEvent(self, ev):
         pos = self.transform_pos(ev.pos())
 
         # Update coordinates in status bar if image is opened
@@ -145,7 +154,7 @@ class Canvas(QWidget):
                     self.override_cursor(CURSOR_POINT)
                     self.current.highlight_vertex(0, Shape.NEAR_VERTEX)
 
-                if self.draw_square:
+                if self.is_square_mode():
                     init_pos = self.current[0]
                     min_x = init_pos.x()
                     min_y = init_pos.y()
@@ -256,6 +265,14 @@ class Canvas(QWidget):
             self.override_cursor(CURSOR_DEFAULT)
 
     def mousePressEvent(self, ev):
+        try:
+            self._mousePressEvent(ev)
+        except Exception as e:
+            print('Error in Canvas.mousePressEvent: %s' % e)
+            import traceback
+            traceback.print_exc()
+
+    def _mousePressEvent(self, ev):
         pos = self.transform_pos(ev.pos())
 
         if ev.button() == Qt.LeftButton:
@@ -276,6 +293,14 @@ class Canvas(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, ev):
+        try:
+            self._mouseReleaseEvent(ev)
+        except Exception as e:
+            print('Error in Canvas.mouseReleaseEvent: %s' % e)
+            import traceback
+            traceback.print_exc()
+
+    def _mouseReleaseEvent(self, ev):
         if ev.button() == Qt.RightButton:
             menu = self.menus[bool(self.selected_shape_copy)]
             self.restore_cursor()
@@ -406,7 +431,7 @@ class Canvas(QWidget):
             clipped_y = min(max(0, pos.y()), size.height())
             pos = QPointF(clipped_x, clipped_y)
 
-        if self.draw_square:
+        if self.is_square_mode():
             opposite_point_index = (index + 2) % 4
             opposite_point = shape[opposite_point_index]
 
@@ -498,61 +523,75 @@ class Canvas(QWidget):
 
         p = self._painter
         p.begin(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setRenderHint(QPainter.HighQualityAntialiasing)
-        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        try:
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setRenderHint(QPainter.HighQualityAntialiasing)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
 
-        p.scale(self.scale, self.scale)
-        p.translate(self.offset_to_center())
+            p.scale(self.scale, self.scale)
+            p.translate(self.offset_to_center())
 
-        temp = self.pixmap
-        if self.overlay_color:
-            temp = QPixmap(self.pixmap)
-            painter = QPainter(temp)
-            painter.setCompositionMode(painter.CompositionMode_Overlay)
-            painter.fillRect(temp.rect(), self.overlay_color)
-            painter.end()
+            temp = self.pixmap
+            if self.overlay_color:
+                temp = QPixmap(self.pixmap)
+                painter = QPainter(temp)
+                painter.setCompositionMode(painter.CompositionMode_Overlay)
+                painter.fillRect(temp.rect(), self.overlay_color)
+                painter.end()
 
-        p.drawPixmap(0, 0, temp)
-        Shape.scale = self.scale
-        Shape.label_font_size = self.label_font_size
-        for shape in self.shapes:
-            if (shape.selected or not self._hide_background) and self.isVisible(shape):
-                shape.fill = shape.selected or shape == self.h_shape
-                shape.paint(p)
-        if self.current:
-            self.current.paint(p)
-            self.line.paint(p)
-        if self.selected_shape_copy:
-            self.selected_shape_copy.paint(p)
+            p.drawPixmap(0, 0, temp)
+            Shape.scale = self.scale
+            Shape.label_font_size = self.label_font_size
+            for shape in self.shapes:
+                try:
+                    if (shape.selected or not self._hide_background) and self.isVisible(shape):
+                        shape.fill = shape.selected or shape == self.h_shape
+                        shape.paint(p)
+                except Exception:
+                    continue  # Skip broken shapes
+            if self.current:
+                try:
+                    self.current.paint(p)
+                    self.line.paint(p)
+                except Exception:
+                    pass
+            if self.selected_shape_copy:
+                try:
+                    self.selected_shape_copy.paint(p)
+                except Exception:
+                    pass
 
-        # Paint rect
-        if self.current is not None and len(self.line) == 2:
-            left_top = self.line[0]
-            right_bottom = self.line[1]
-            rect_width = right_bottom.x() - left_top.x()
-            rect_height = right_bottom.y() - left_top.y()
-            p.setPen(self.drawing_rect_color)
-            brush = QBrush(Qt.BDiagPattern)
-            p.setBrush(brush)
-            p.drawRect(int(left_top.x()), int(left_top.y()), int(rect_width), int(rect_height))
+            # Paint rect
+            if self.current is not None and len(self.line) == 2:
+                left_top = self.line[0]
+                right_bottom = self.line[1]
+                rect_width = right_bottom.x() - left_top.x()
+                rect_height = right_bottom.y() - left_top.y()
+                p.setPen(self.drawing_rect_color)
+                brush = QBrush(Qt.BDiagPattern)
+                p.setBrush(brush)
+                p.drawRect(int(left_top.x()), int(left_top.y()), int(rect_width), int(rect_height))
 
-        if self.drawing() and not self.prev_point.isNull() and not self.out_of_pixmap(self.prev_point):
-            p.setPen(QColor(0, 0, 0))
-            p.drawLine(int(self.prev_point.x()), 0, int(self.prev_point.x()), int(self.pixmap.height()))
-            p.drawLine(0, int(self.prev_point.y()), int(self.pixmap.width()), int(self.prev_point.y()))
+            if self.drawing() and not self.prev_point.isNull() and not self.out_of_pixmap(self.prev_point):
+                p.setPen(QColor(0, 0, 0))
+                p.drawLine(int(self.prev_point.x()), 0, int(self.prev_point.x()), int(self.pixmap.height()))
+                p.drawLine(0, int(self.prev_point.y()), int(self.pixmap.width()), int(self.prev_point.y()))
 
-        self.setAutoFillBackground(True)
-        if self.verified:
-            pal = self.palette()
-            pal.setColor(self.backgroundRole(), QColor(184, 239, 38, 128))
-            self.setPalette(pal)
-        else:
-            pal = self.palette()
-            pal.setColor(self.backgroundRole(), QColor(232, 232, 232, 255))
-            self.setPalette(pal)
-
-        p.end()
+            self.setAutoFillBackground(True)
+            if self.verified:
+                pal = self.palette()
+                pal.setColor(self.backgroundRole(), QColor(184, 239, 38, 128))
+                self.setPalette(pal)
+            else:
+                pal = self.palette()
+                pal.setColor(self.backgroundRole(), QColor(232, 232, 232, 255))
+                self.setPalette(pal)
+        except Exception as e:
+            print('Error in Canvas.paintEvent: %s' % e)
+            import traceback
+            traceback.print_exc()
+        finally:
+            p.end()
 
     def transform_pos(self, point):
         """Convert from widget-logical coordinates to painter-logical coordinates."""
@@ -746,3 +785,12 @@ class Canvas(QWidget):
 
     def set_drawing_shape_to_square(self, status):
         self.draw_square = status
+
+    def is_square_mode(self):
+        """Check if square-drawing mode is active.
+
+        Square mode activates when:
+        - The permanent toggle is on (Ctrl+Shift+R), OR
+        - Ctrl key is currently held down (temporary)
+        """
+        return self.draw_square or bool(QApplication.keyboardModifiers() & Qt.ControlModifier)

@@ -37,79 +37,97 @@ class LabelFile(object):
         self.verified = False
 
     def save_create_ml_format(self, filename, shapes, image_path, image_data, class_list, line_color=None, fill_color=None, database_src=None):
-        img_folder_name = os.path.basename(os.path.dirname(image_path))
-        img_file_name = os.path.basename(image_path)
+        try:
+            img_folder_name = os.path.basename(os.path.dirname(image_path))
+            img_file_name = os.path.basename(image_path)
 
-        image = QImage()
-        image.load(image_path)
-        image_shape = [image.height(), image.width(),
-                       1 if image.isGrayscale() else 3]
-        writer = CreateMLWriter(img_folder_name, img_file_name,
-                                image_shape, shapes, filename, local_img_path=image_path)
-        writer.verified = self.verified
-        writer.write()
-        return
+            image = QImage()
+            image.load(image_path)
+            image_shape = [image.height(), image.width(),
+                           1 if image.isGrayscale() else 3]
+            writer = CreateMLWriter(img_folder_name, img_file_name,
+                                    image_shape, shapes, filename, local_img_path=image_path)
+            writer.verified = self.verified
+            writer.write()
+            return
+        except Exception as e:
+            print('Error in save_create_ml_format: %s' % e)
+            import traceback
+            traceback.print_exc()
+            raise LabelFileError('Failed to save CreateML: %s' % e)
 
 
     def save_pascal_voc_format(self, filename, shapes, image_path, image_data,
                                line_color=None, fill_color=None, database_src=None):
-        img_folder_path = os.path.dirname(image_path)
-        img_folder_name = os.path.split(img_folder_path)[-1]
-        img_file_name = os.path.basename(image_path)
-        # imgFileNameWithoutExt = os.path.splitext(img_file_name)[0]
-        # Read from file path because self.imageData might be empty if saving to
-        # Pascal format
-        if isinstance(image_data, QImage):
-            image = image_data
-        else:
-            image = QImage()
-            image.load(image_path)
-        image_shape = [image.height(), image.width(),
-                       1 if image.isGrayscale() else 3]
-        writer = PascalVocWriter(img_folder_name, img_file_name,
-                                 image_shape, local_img_path=image_path)
-        writer.verified = self.verified
+        try:
+            img_folder_path = os.path.dirname(image_path)
+            img_folder_name = os.path.split(img_folder_path)[-1]
+            img_file_name = os.path.basename(image_path)
+            # imgFileNameWithoutExt = os.path.splitext(img_file_name)[0]
+            # Read from file path because self.imageData might be empty if saving to
+            # Pascal format
+            if isinstance(image_data, QImage):
+                image = image_data
+            else:
+                image = QImage()
+                image.load(image_path)
+            image_shape = [image.height(), image.width(),
+                           1 if image.isGrayscale() else 3]
+            writer = PascalVocWriter(img_folder_name, img_file_name,
+                                     image_shape, local_img_path=image_path)
+            writer.verified = self.verified
 
-        for shape in shapes:
-            points = shape['points']
-            label = shape['label']
-            # Add Chris
-            difficult = int(shape['difficult'])
-            bnd_box = LabelFile.convert_points_to_bnd_box(points)
-            writer.add_bnd_box(bnd_box[0], bnd_box[1], bnd_box[2], bnd_box[3], label, difficult)
+            for shape in shapes:
+                points = shape['points']
+                label = shape['label']
+                # Add Chris
+                difficult = int(shape['difficult'])
+                bnd_box = LabelFile.convert_points_to_bnd_box(points)
+                writer.add_bnd_box(bnd_box[0], bnd_box[1], bnd_box[2], bnd_box[3], label, difficult)
 
-        writer.save(target_file=filename)
-        return
+            writer.save(target_file=filename)
+            return
+        except Exception as e:
+            print('Error in save_pascal_voc_format: %s' % e)
+            import traceback
+            traceback.print_exc()
+            raise LabelFileError('Failed to save Pascal VOC: %s' % e)
 
     def save_yolo_format(self, filename, shapes, image_path, image_data, class_list,
                          line_color=None, fill_color=None, database_src=None):
-        img_folder_path = os.path.dirname(image_path)
-        img_folder_name = os.path.split(img_folder_path)[-1]
-        img_file_name = os.path.basename(image_path)
-        # imgFileNameWithoutExt = os.path.splitext(img_file_name)[0]
-        # Read from file path because self.imageData might be empty if saving to
-        # Pascal format
-        if isinstance(image_data, QImage):
-            image = image_data
-        else:
-            image = QImage()
-            image.load(image_path)
-        image_shape = [image.height(), image.width(),
-                       1 if image.isGrayscale() else 3]
-        writer = YOLOWriter(img_folder_name, img_file_name,
-                            image_shape, local_img_path=image_path)
-        writer.verified = self.verified
+        try:
+            img_folder_path = os.path.dirname(image_path)
+            img_folder_name = os.path.split(img_folder_path)[-1]
+            img_file_name = os.path.basename(image_path)
+            # imgFileNameWithoutExt = os.path.splitext(img_file_name)[0]
+            # Read from file path because self.imageData might be empty if saving to
+            # Pascal format
+            if isinstance(image_data, QImage):
+                image = image_data
+            else:
+                image = QImage()
+                image.load(image_path)
+            image_shape = [image.height(), image.width(),
+                           1 if image.isGrayscale() else 3]
+            writer = YOLOWriter(img_folder_name, img_file_name,
+                                image_shape, local_img_path=image_path)
+            writer.verified = self.verified
 
-        for shape in shapes:
-            points = shape['points']
-            label = shape['label']
-            # Add Chris
-            difficult = int(shape['difficult'])
-            bnd_box = LabelFile.convert_points_to_bnd_box(points)
-            writer.add_bnd_box(bnd_box[0], bnd_box[1], bnd_box[2], bnd_box[3], label, difficult)
+            for shape in shapes:
+                points = shape['points']
+                label = shape['label']
+                # Add Chris
+                difficult = int(shape['difficult'])
+                bnd_box = LabelFile.convert_points_to_bnd_box(points)
+                writer.add_bnd_box(bnd_box[0], bnd_box[1], bnd_box[2], bnd_box[3], label, difficult)
 
-        writer.save(target_file=filename, class_list=class_list)
-        return
+            writer.save(target_file=filename, class_list=class_list)
+            return
+        except Exception as e:
+            print('Error in save_yolo_format: %s' % e)
+            import traceback
+            traceback.print_exc()
+            raise LabelFileError('Failed to save YOLO: %s' % e)
 
     def toggle_verify(self):
         self.verified = not self.verified
